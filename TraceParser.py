@@ -1,10 +1,17 @@
 # TraceParser.py --- parsing the .trs file
-# Author: Vodka
+# Author: Zhang Chi
 # Email:vodkazc@gmail.com
 # Date: 2016.06.08
 
 import logging
-import os
+from struct import pack, unpack
+from ctypes import *
+
+
+# load C library
+try: libc = cdll.msvcrt       # Windows
+except AttributeError:
+     libc = CDLL("libc.so.6") # Linux
 
 
 class CommonFile(object):
@@ -14,19 +21,53 @@ class CommonFile(object):
         self.path = path
         self.byteNum = 0
         self.fileHandler = None
+        self.fileHandlerC = None
 
     def openFile(self, mode):
-        if os.path.exists(self.path):
+        # if os.path.exists(self.path):
+        if mode[0] == 'r':
+            # in read mode
             self.fileHandler = open(self.path, mode)
-            return True
         else:
-            logging.info(self.path + 'does not exist.')
-            return False
+            # in write/append mode
+            libc.fopen.restype    = c_void_p
+            libc.fopen.argtypes   = c_char_p, c_char_p
+            self.fileHandlerC     = libc.fopen(self.path.encode('utf-8'), mode.encode('utf-8'))
+        # return True
+        # else:
+        #     logging.info(self.path + 'does not exist.')
+        #     return False
 
     def closeFile(self):
         if self.fileHandler:
             self.fileHandler.close()
+            self.byteNum = 0
         return True
+
+    def closeFileC(self):
+        if self.fileHandlerC:
+            libc.fclose.argtypes = c_void_p,
+            libc.fclose.restype  = c_int
+            libc.fclose(self.fileHandlerC)
+            self.byteNum = 0
+        return True
+
+    def writeFile(self, point_list):
+        libc.fwrite.argtypes = c_void_p ,c_size_t, c_size_t, c_void_p
+        libc.fwrite.restype  = c_size_t
+        # generate a c-style string buffer from python list
+        c_buf = (c_float*len(point_list))(*point_list)
+        n_items = libc.fwrite(c_buf, 4, len(point_list), self.fileHandlerC)
+        # print('points written: ',n_items, ', actual points: ',len(point_list))
+        return True
+
+    def writeByte(self, byte_str):
+        libc.fwrite.argtypes = c_void_p ,c_size_t, c_size_t, c_void_p
+        libc.fwrite.restype  = c_size_t
+        # print(byte_str)
+        n_items = libc.fwrite(byte_str, 1, len(byte_str), self.fileHandlerC)
+        return True
+
 
     def readByte(self, num):
         byte_re = self.fileHandler.read(num)
@@ -48,12 +89,10 @@ class CommonFile(object):
         self.byteNum += num
         return byte_re.decode()
 
-    def writeByte(self, byte_str):
-        self.fileHandler.write(byte_str)
-        return True
 
-    def writeInt(self, data_in):
-        self.fileHandler.write(data_in)
+    def seekFile(self, num=0):
+        self.fileHandler.seek(num, 0)
+        return True
 
 
 class Trace(object):
@@ -82,7 +121,7 @@ class Trace(object):
         self.yAxisScale = 0
         self.traceOffsetForDisp = 0
         self.logScale = 0
-        self.parseTraceHeader()
+        # self.parseTraceHeader()
 
     def readHeaderDataLength(self):
         data_length = self.traceFile.readInt(1)
@@ -100,9 +139,6 @@ class Trace(object):
             if ch not in self.TraceSetObjects:
                 logging.error('Unknown Trace Header :' + ch.hex())
                 raise ValueError('Unknown Trace Header :' + ch.hex())
-            if self.TraceSetObjects[ch] in self.TraceHeader:
-                logging.error('Duplicate Trace Header :' + ch.hex())
-                raise ValueError('Duplication Trace Header')
             if ch == b'\x5F':
                 logging.debug('Parsing Trace File End.')
                 self.readHeaderDataLength()
@@ -215,3 +251,94 @@ class Trace(object):
 
         self.traceFile.closeFile()
         return True
+
+    def getTrace(self, index):
+        if index < 0 or index > self.traceNumber - 1:
+            logging.error('Wrong Trace Index')
+            raise ValueError('Wrong Trace Index')
+
+        samplePoint = ()
+        traceTitle = ''
+        cryptoData = None
+        self.traceFile.openFile('rb')
+        self.traceFile.seekFile(self.headerLength + index * (self.titleSpace + self.cryptoDataLength + self.pointCount))
+        if self.titleSpace != 0:
+            traceTitle = self.traceFile.readStr(self.titleSpace).decode('utf-8')
+            logging.debug('Trace %d title : %s' % (index, traceTitle))
+        if self.cryptoDataLength != 0:
+            cryptoData = list(self.traceFile.readByte(self.cryptoDataLength))
+            logging.debug('CryptoData:' + str(cryptoData))
+        if self.pointCount != 0:
+            if self.sampleCoding == 0:
+                bstr = self.traceFile.readByte(self.sampleLength * self.pointCount)
+                if self.sampleLength == 1:
+                    samplePoint = unpack(str(self.pointCount) + 'B', bstr)
+                elif self.sampleLength == 2:
+                    samplePoint = unpack('<' + str(self.pointCount) + 'H', bstr)
+                elif self.sampleLength == 4:
+                    samplePoint = unpack('<' + str(self.pointCount) + 'I', bstr)
+            else:
+                bstr = self.traceFile.readByte(self.sampleLength * self.pointCount)
+                samplePoint = unpack('<' + str(self.pointCount) + 'f', bstr)
+
+        return [traceTitle, cryptoData, samplePoint]
+
+    def setTraceNumber(self, traceNumber):
+        self.traceNumber = traceNumber
+
+    def setPointCount(self, pointCount):
+        self.pointCount = pointCount
+
+    def setSampleCoding(self, sampleCoding=0, sampleLength=1):
+        self.sampleCoding = sampleCoding
+        self.sampleLength = sampleLength
+
+	def setDataLength(self, dataLength = 0):
+		self.cryptoDataLength = dataLength
+
+    def generateTraceHeader(self):
+        traceHeader = b'\x41\x04'
+        traceHeader += self.traceNumber.to_bytes(4, 'little')
+        traceHeader += b'\x42\x04'
+        traceHeader += self.pointCount.to_bytes(4, 'little')
+        traceHeader += b'\x43\x01'
+        if self.sampleCoding == 0:
+            traceHeader += self.sampleLength.to_bytes(1, 'little')
+        else:
+            traceHeader += (self.sampleLength | 0x10).to_bytes(1, 'little')
+
+        traceHeader += b'\x44\x02'
+        traceHeader += self.cryptoDataLength.to_bytes(2,'little')
+        traceHeader += b'\x5F\x00'
+
+        self.traceFile.openFile('wb')
+        self.traceFile.writeByte(traceHeader)
+        self.traceFile.closeFileC()
+
+    def generateTrace(self, point, cryptoData=None, title=None):
+        traceStr = b''
+        self.traceFile.openFile('ab+')
+        if title is not None:
+            # traceStr += title.encode('utf8')
+            self.traceFile.writeByte(title.encode('utf8'))
+        if cryptoData is not None:
+            # traceStr += bytes(cryptoData, 'utf8')
+            self.traceFile.writeByte(bytes(cryptoData, 'utf8'))
+        if self.sampleCoding == 0:
+            if self.sampleLength == 1:
+                traceStr += bytes(point)
+            elif self.sampleLength == 2:
+                for i in point:
+                    traceStr += pack('<H', i)
+            elif self.sampleLength == 4:
+                for i in point:
+                    traceStr += pack('<I', i)
+        else:
+            self.traceFile.writeFile(point)
+            # for i in point:
+            #     # traceStr += pack('<f', i)
+            #     self.traceFile.writeByte(pack('<f', i))
+
+        # self.traceFile.writeByte(traceStr)
+        self.traceFile.closeFileC()
+
